@@ -1,4 +1,4 @@
-name: TyreTrack V5 Windows Portable
+name: TyreTrack V5 Windows Diagnostic
 
 on:
   workflow_dispatch:
@@ -7,57 +7,83 @@ permissions:
   contents: read
 
 jobs:
-  windows-build:
+  diagnose-and-build:
     runs-on: windows-latest
     timeout-minutes: 120
     defaults:
       run:
         shell: pwsh
     steps:
-      - name: Check out source
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.12 x64
+      - name: Install Python 3.12 x64
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-          architecture: x64
+          architecture: 'x64'
 
-      - name: Install CPU-only PyTorch
+      - name: Install CPU PyTorch
         run: |
           python -m pip install --upgrade pip setuptools wheel
           python -m pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Install application and packaging dependencies
-        run: |
-          python -m pip install -r requirements-github.txt
+      - name: Install application requirements
+        run: python -m pip install -r requirements-github.txt
 
-      - name: Validate dependencies and model
+      - name: Validate dependencies, model and reporting
         run: |
-          python -c "import torch, torchvision, cv2, depthai, ultralytics, optree; from PyQt5.QtWidgets import QApplication; from ultralytics import YOLO; print('torch',torch.__version__); print('depthai',depthai.__version__); print('tensor',torch.zeros(1)); print('model task',YOLO('tyre_detector.pt').task)"
+          python -c "import torch, torchvision, cv2, depthai, ultralytics, optree; from PyQt5.QtWidgets import QApplication; from ultralytics import YOLO; print('torch:', torch.__version__); print('depthai:', depthai.__version__); print('tensor:', torch.zeros(1)); print('model task:', YOLO('tyre_detector.pt').task)"
           python -m py_compile TyreTrack_Production_Monitor.py count_line.py hourly_dashboard.py
           python tyretrack_report_sync_test.py
 
-      - name: Build repaired V5 and smoke-test EXE
-        run: python BUILD_V5_REPAIRED.py
+      - name: Build V5 and run startup check
+        id: build
+        continue-on-error: true
+        run: |
+          python BUILD_V5_REPAIRED.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-      - name: Upload startup logs (even on failure)
+      - name: PRINT STARTUP ERROR IN ACTIONS LOG
+        if: always()
+        run: |
+          $logs = @(Get-ChildItem -Path build -Recurse -File -Filter startup_output.txt -ErrorAction SilentlyContinue)
+          if ($logs.Count -eq 0) {
+            Write-Host 'No startup_output.txt found; inspect preceding build step.'
+          } else {
+            foreach ($log in $logs) {
+              Write-Host "===== STARTUP ERROR: $($log.FullName) ====="
+              Get-Content -LiteralPath $log.FullName -ErrorAction Continue
+            }
+          }
+          Get-ChildItem -Path build -Recurse -File -Filter warn-TyreTrack.txt -ErrorAction SilentlyContinue | ForEach-Object {
+            Write-Host "===== PYINSTALLER WARNINGS: $($_.FullName) ====="
+            Get-Content -LiteralPath $_.FullName | Select-Object -Last 100
+          }
+
+      - name: Upload diagnostic logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: TyreTrack-V5-build-logs
+          name: TyreTrack-V5-Diagnostic-Logs
           path: |
             build/**/startup_output.txt
             build/**/work/TyreTrack/warn-TyreTrack.txt
-          if-no-files-found: ignore
-          retention-days: 7
+          if-no-files-found: warn
+          retention-days: 14
 
-      - name: Upload Windows portable release
-        if: success()
+      - name: Upload portable application when startup passes
+        if: steps.build.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: TyreTrack-V5-Windows-Portable
           path: releases/TyreTrack_V5_*/
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 14
           compression-level: 0
+
+      - name: Fail workflow if startup check failed
+        if: steps.build.outcome != 'success'
+        run: |
+          Write-Error 'TyreTrack startup failed. See PRINT STARTUP ERROR IN ACTIONS LOG and diagnostic artifact.'
+          exit 1
